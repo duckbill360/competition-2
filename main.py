@@ -360,3 +360,117 @@ with tf.device('/device:CPU:0'):
     sess.run(tf.global_variables_initializer())
     step = train_model(sess, model)
 model.save_model(sess, step)
+
+
+###### Testing ######
+df_test = pd.read_pickle('./dataset/test_data.pkl')
+
+tf.reset_default_graph()
+
+# read testing data
+X_test_image_name = tf.constant(df_test['image_name'].as_matrix())
+test_dataset = Dataset.from_tensor_slices((X_test_image_name))
+
+test_dataset = test_dataset.map(
+    data_generator, num_threads=4, output_buffer_size=20)
+test_dataset = test_dataset.batch(1)
+
+iterator = Iterator.from_structure(test_dataset.output_types,
+                                   test_dataset.output_shapes)
+next_element = iterator.get_next()
+testing_init_op = iterator.make_initializer(test_dataset)
+
+
+#load model
+model = CNNModel()
+
+result_cls, result_reg = [], []
+with tf.Session() as sess:
+    model.load_model(sess)
+    model.test_mode()
+    with tf.device('/gpu:0'):
+        sess.run(testing_init_op)
+        while True:
+            try:
+                x_img, x_img_name = sess.run(next_element)
+
+                feed_dict = {model.input_layer: x_img}
+
+                logits_cls, logits_reg = sess.run(
+                    [model.out_cls, model.logits_reg], feed_dict=feed_dict)
+
+                result_cls.append(logits_cls)
+                result_reg.append(logits_reg)
+            except tf.errors.OutOfRangeError:
+                break
+
+# Output bounding boxes
+num_test_img = df_test.shape[0]
+
+bbox_preds = []
+bbox_cls = []
+for img in range(num_test_img):
+    bbox_pred = []
+    bbox_c = []
+    bbox_pred.append(reg_to_bbox(result_reg[img][0], np.array([0, 0, img_width, img_height])))
+    bbox_c.append(np.argmax(result_cls[img]))
+
+    bbox_cls.append(np.array(bbox_c))
+    bbox_preds.append(np.array(bbox_pred))
+
+for img in range(num_test_img):
+    imgage = Image.open("./dataset/JPEGImages/" + df_test['image_name'][img])
+    w = imgage.size[0]
+    h = imgage.size[1]
+    boxes = bbox_preds[img]
+
+    boxes[:, [0, 2]] = boxes[:, [0, 2]] * (w / img_width)
+    boxes[:, [1, 3]] = boxes[:, [1, 3]] * (h / img_height)
+    bbox_preds[img] = boxes
+
+
+###### Run evaluation function and get csv file ######
+import sys
+#please ad ./evaluate file into your system path
+sys.path.insert(0, './evaluate')
+import evaluate
+evaluate.evaluate(bbox_preds, bbox_cls)
+
+
+###### Visualization ######
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import Image
+import numpy as np
+show = 21
+im = np.array(
+    Image.open("./dataset/JPEGImages/" + df_test['image_name'][show]),
+    dtype=np.uint8)
+
+# Create figure and axes
+fig, ax = plt.subplots(1)
+
+# Show the image
+ax.imshow(im)
+
+# Create a Rectangle patch
+x1, y1, x2, y2 = bbox_preds[show][0].astype(int)
+
+rect = patches.Rectangle(
+    (x1, y1),
+    x2 - x1,
+    y2 - y1,
+    linewidth=2,
+    edgecolor='r',
+    facecolor='none',
+    label=classes[int(bbox_cls[show])])
+
+# Add the bounding box to the Axes
+ax.add_patch(rect)
+plt.text(x1, y1, classes[int(bbox_cls[show])], color='blue', fontsize=15)
+
+plt.show()
+
+
+
+
