@@ -131,8 +131,10 @@ df = pd.read_pickle('./dataset/data_train_one.pkl')
 valid_ratio = 0.1
 df_train, df_valid = _train_valid_split(df, valid_ratio)
 
-# Define data_generator
+
+###### Define data_generator ######
 # For each image, we generate an image array and its name. As a generator for tf.contrib.data.dataset to use.
+
 
 def data_generator(image_name):
     file_path = './dataset/JPEGImages/'
@@ -150,3 +152,233 @@ def data_generator(image_name):
 tf.reset_default_graph()
 
 
+# Create tensorflow iterator to process data loading
+
+X_train_image_name = tf.constant(df_train['image_name'].as_matrix())
+X_valid_image_name = tf.constant(df_valid['image_name'].as_matrix())
+
+train_dataset = Dataset.from_tensor_slices((X_train_image_name))
+valid_dataset = Dataset.from_tensor_slices((X_valid_image_name))
+
+# Mapping train_dataset
+train_dataset = train_dataset.map(
+    data_generator, num_threads=4, output_buffer_size=8 * batch_size)
+train_dataset = train_dataset.shuffle(8 * batch_size)
+train_dataset = train_dataset.batch(batch_size)
+
+# Mapping valid_dataset
+valid_dataset = valid_dataset.map(
+    data_generator, num_threads=4, output_buffer_size=8 * batch_size)
+valid_dataset = valid_dataset.shuffle(8 * batch_size)
+valid_dataset = valid_dataset.batch(batch_size)
+
+# create TensorFlow Iterator object
+iterator = Iterator.from_structure(train_dataset.output_types,
+                                   train_dataset.output_shapes)
+next_element = iterator.get_next()
+
+# create two initialization ops to switch between the datasets
+training_init_op = iterator.make_initializer(train_dataset)
+validation_init_op = iterator.make_initializer(valid_dataset)
+
+
+###### Simplified Object detection model #####
+# Define single layers
+
+# convolution
+def conv2d(name, input_layer, kernel_size, filters, padding='same', relu=True):
+    if relu:
+        output = tf.layers.conv2d(
+            inputs=input_layer,
+            filters=filters,
+            kernel_size=kernel_size,
+            padding=padding,
+            activation=tf.nn.relu,
+            name=name)
+    else:
+        output = tf.layers.conv2d(
+            inputs=input_layer,
+            filters=filters,
+            kernel_size=kernel_size,
+            padding=padding,
+            name=name)
+    return output
+
+
+# max pooling
+def max_pool(name, input_layer, window):
+    return tf.layers.max_pooling2d(
+        inputs=input_layer, pool_size=[window, window], strides=window)
+
+
+def norm(name, input_layer):
+    return tf.layers.batch_normalization(input_layer)
+
+
+# Define CNN model
+class CNNModel(object):
+
+    def __init__(self, name='cnn'):
+        self.name = name
+        self.istrain = True
+        with tf.variable_scope(self.name):
+          self.build_model()
+
+    def build_model(self):
+
+        # input image and roiboxes
+        self.input_layer = tf.placeholder(
+            dtype=tf.float32, shape=[None, img_width, img_height, 3])
+
+        # input traning ground truth [batch_numer, [label, 4]]
+        self.gt_bbox_targets = tf.placeholder(dtype=tf.float32, shape=[None, 5])
+
+        # conv 1
+        conv1_1 = conv2d('conv1_1', self.input_layer, [3, 3], 64)
+        pool1 = max_pool('pool1', conv1_1, 2)
+        norm1 = norm('norm1', pool1)
+
+        conv1_2 = conv2d('conv1_2', norm1, [3, 3], 64)
+        pool2 = max_pool('pool2', conv1_2, 2)
+        norm2 = norm('norm2', pool2)
+
+        conv2_1 = conv2d('conv2_1', norm2, [3, 3], 64)
+        pool2_2 = max_pool('pool2_2', conv2_1, 2)
+        norm2_2 = norm('norm2_2', pool2_2)
+
+        conv3_1 = conv2d('conv3_1', norm2_2, [3, 3], 64)
+        pool3_1 = max_pool('pool3_1', conv3_1, 2)
+        norm3_1 = norm('norm3_1', pool3_1)
+
+        conv3_2 = conv2d('conv3_2', norm3_1, [3, 3], 64)
+        pool3_2 = max_pool('pool3_2', conv3_2, 4)
+        norm3_2 = norm('norm3_2', pool3_2)
+
+        flatten = tf.reshape(norm3_2, [-1, 1792])
+
+        # dense layers
+        dense1 = tf.layers.dense(flatten, 128, activation=tf.nn.relu)
+        dropout1 = tf.layers.dropout(dense1, rate=0.4, training=self.istrain)
+
+        dense2 = tf.layers.dense(dropout1, 256, activation=tf.nn.relu)
+        dropout2 = tf.layers.dropout(dense2, rate=0.4, training=self.istrain)
+
+        # box and class predication
+        # for object classification
+        self.logits_cls = tf.layers.dense(dropout2, num_classes)
+        self.out_cls = tf.nn.softmax(self.logits_cls)
+
+        # for bounding box prediction
+        self.logits_reg = tf.layers.dense(dropout2, 4)
+
+        # calculate loss
+        gt_cls, gt_reg = tf.split(self.gt_bbox_targets, [1, 4], 1)
+
+        gt_cls_raw = tf.cast(gt_cls, tf.int64)
+        gt_cls = tf.reshape(tf.one_hot(gt_cls_raw, num_classes), [-1, num_classes])
+
+        self.loss_cls = tf.reduce_mean(
+            tf.nn.softmax_cross_entropy_with_logits(
+                labels=gt_cls, logits=self.logits_cls))
+
+        self.loss_reg = tf.losses.mean_squared_error(gt_reg, self.logits_reg)
+
+        self.loss = self.loss_cls + 2 * self.loss_reg
+
+        self.lr = tf.placeholder(tf.float32, [])
+        self.global_step = tf.Variable(0, name="global_step", trainable=False)
+        optimizer = tf.train.AdamOptimizer(self.lr)
+        self.train_op = optimizer.minimize(self.loss, global_step=self.global_step)
+
+    def save_model(self, sess, global_step):
+        var_list = [v for v in tf.global_variables() if self.name in v.name]
+        saver = tf.train.Saver(var_list)
+        saver.save(sess, './checkpoint/cnn', global_step)
+
+    def load_model(self, sess):
+        var_list = [v for v in tf.global_variables() if self.name in v.name]
+        saver = tf.train.Saver(var_list)
+        ckpt = tf.train.get_checkpoint_state('./checkpoint/')
+        tf.logging.info('Loading model %s.', ckpt.model_checkpoint_path)
+        saver.restore(sess, ckpt.model_checkpoint_path)
+
+    def test_mode(self):
+        self.istrain = False
+
+    def train_mode(self):
+        self.istrain = True
+
+
+# Training
+# for each image, get the ground truth target to feed when training
+def get_ground_truth(x_indx, dataframe):
+    target_batch = []
+    for index in x_indx:
+        target_batch.append(dataframe['one_gt'][index])
+    return np.array(target_batch)
+
+
+def train_model(sess, model, epoch=5):
+    for e in range(epoch):
+        model.train_mode()
+        sess.run(training_init_op)
+        losses = []
+    while True:
+
+        try:
+            x_img, x_img_names = sess.run(next_element)
+            x_indx = [
+                df_train.index[df_train['image_name'] == name.decode("utf-8")]
+                .tolist()[0] for name in x_img_names
+            ]
+
+            y_gt = get_ground_truth(x_indx, df_train)
+            feed_dict = {
+                model.input_layer: x_img,
+                model.gt_bbox_targets: y_gt,
+                model.lr: 0.0001,
+            }
+
+            _, loss, step = sess.run(
+                [model.train_op, model.loss, model.global_step],
+                feed_dict=feed_dict)
+            losses.append(loss)
+
+        except tf.errors.OutOfRangeError:
+            print('%d epoch with training loss %f' % (e, np.mean(losses)))
+            break
+
+    model.test_mode()
+    sess.run(validation_init_op)
+
+    losses_v = []
+    while True:
+        try:
+            x_img, x_img_names = sess.run(next_element)
+            x_indx = [
+                df_valid.index[df_valid['image_name'] == name.decode("utf-8")]
+                .tolist()[0] for name in x_img_names
+            ]
+            y_gt = get_ground_truth(x_indx, df_valid)
+
+            feed_dict = {
+                model.input_layer: x_img,
+                model.gt_bbox_targets: y_gt,
+            }
+
+            loss = sess.run([model.loss], feed_dict=feed_dict)
+
+            losses_v.append(loss)
+        except tf.errors.OutOfRangeError:
+            print('%d epoch with validation loss %f\n' % (e, np.mean(losses_v)))
+            break
+
+    return step
+
+
+model = CNNModel()
+sess = tf.Session()
+with tf.device('/device:CPU:0'):
+    sess.run(tf.global_variables_initializer())
+    step = train_model(sess, model)
+model.save_model(sess, step)
