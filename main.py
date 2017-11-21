@@ -356,7 +356,7 @@ def train_model(sess, model, epoch=5):
 
 model = CNNModel()
 sess = tf.Session()
-with tf.device('/device:CPU:0'):
+with tf.device('/device:gpu:0'):
     sess.run(tf.global_variables_initializer())
     step = train_model(sess, model)
 model.save_model(sess, step)
@@ -431,9 +431,12 @@ for img in range(num_test_img):
 
 ###### Run evaluation function and get csv file ######
 import sys
-#please ad ./evaluate file into your system path
+
+#please add ./evaluate file into your system path
 sys.path.insert(0, './evaluate')
+
 import evaluate
+
 evaluate.evaluate(bbox_preds, bbox_cls)
 
 
@@ -470,7 +473,5 @@ ax.add_patch(rect)
 plt.text(x1, y1, classes[int(bbox_cls[show])], color='blue', fontsize=15)
 
 plt.show()
-
-
 
 
