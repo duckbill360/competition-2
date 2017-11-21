@@ -356,7 +356,7 @@ def train_model(sess, model, epoch=5):
 
 model = CNNModel()
 sess = tf.Session()
-with tf.device('/device:gpu:0'):
+with tf.device('/gpu:0'):
     sess.run(tf.global_variables_initializer())
     step = train_model(sess, model)
 model.save_model(sess, step)
